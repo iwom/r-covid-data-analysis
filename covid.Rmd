@@ -17,6 +17,7 @@ knitr::opts_chunk$set(warning = FALSE)
 knitr::opts_chunk$set(message = FALSE)
 knitr::opts_chunk$set(echo = FALSE)
 knitr::opts_chunk$set(include = TRUE)
+knitr::opts_chunk$set(results = FALSE)
 ```
 
 ```{r libraries}
@@ -285,7 +286,7 @@ c_data <- data %>%
   group_by(patient_id, age, gender, outcome, in_hospital_days) %>%
   summarise_at(vars(hypersensitive_cardiac_troponin_i:creatinine), median, na.rm = TRUE ) %>%
   ungroup() %>%
-  select(-patient_id)
+  select(-patient_id, -x2019_n_co_v_nucleic_acid_detection)
 c_data <- na_mean(c_data)
 train_ids <-
   createDataPartition(
@@ -325,7 +326,6 @@ cm_st$cm.overall <- round(cm_st$cm.overall,2)
 cm_p <- as.data.frame(prop.table(cm$table))
 cm_rf$Perc <- round(cm_p$Freq*100,2)
 cm_rf$Model <- "RF"
-
 ```
 
 ```{r glm-classification}
@@ -398,6 +398,6 @@ bwplot(resample_results, metric = c("Kappa","Accuracy", "Recall"), main="Classif
 
 ## Used packages
 
-```{r show-libs}
-(.packages())
+```{r show-libs, include=TRUE}
+knitr::kable(as.data.frame(.packages()), caption = "Used packages")
 ```
