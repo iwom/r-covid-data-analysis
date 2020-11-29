@@ -1,0 +1,403 @@
+---
+title: "Covid data analysis"
+author: "Iwo Małyszka"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: yes
+    df_print: paged
+  html_notebook:
+    toc: yes
+  pdf_document:
+    toc: yes
+---
+
+```{r defaults, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(include = TRUE)
+```
+
+```{r libraries}
+library(ggplot2)
+library(DT)
+library(openxlsx)
+library(tidyr)
+library(dplyr)
+library(janitor)
+library(caret)
+library(plotly)
+library(imputeTS)
+library(mlbench)
+library(MLmetrics)
+library(grid)
+library(gridExtra)
+```
+
+
+```{r fetching-data, include=FALSE}
+set.seed(66)
+data <- read.xlsx("http://www.cs.put.poznan.pl/dbrzezinski/teaching/zed/wuhan_blood_sample_data_Jan_Feb_2020.xlsx", fillMergedCells = TRUE)
+```
+
+## Introduction
+
+### Background
+The goal of this article is to analyse and visualise important factors to COVID-19 mortality. It also presents classification results for selection of popular classifiers. The analysis is based on COVID disease research conducted by Yan et al. For more details please see: https://www.nature.com/articles/s42256-020-0180-7.
+
+
+### Dataset
+The dataset consists of blood test samples collected from 375 patients admitted to Wuhan Tongji Hospital between 10 January 2020 and 18 February 2020. It contains 6121 records filled with blood metrics and biomarker levels obtained from the samples. There are 81 columns in total, some of them being particularly important for the following analysis, i.e.:
+
+*   Patient age
+*   Patient gender (1 - male, 2 - female)
+*   Admission time
+*   Discharge time
+*   Outcome (0 - survived, 1 - deceased)
+*   HS-CRP level
+*   LDH level
+*   Neutrophils percentage
+
+Data pre-processing included following stages:
+
+*   Renaming columns
+*   Converting datetime values to POSIX format
+*   Calculating total time spent in hospital for each patient
+*   Encoding column values as factors
+
+## Analysis
+
+### Patient overiew
+
+Patient age ranged from 18 to 95 years. Children data was excluded from the dataset by original authors. Age distribution in males could be approximated with normal distribution bell curve with mean value of 58 years old. On the other hand, the age distribution in females is closer to discrete uniform distribution. Maximum treatment time lasted for 36 days. Overall mortality risk calculated for the dataset is 46%.
+
+
+```{r data-transformation, include=FALSE}
+data <- data %>% 
+  clean_names() %>%
+  mutate(re_date = ifelse(is.na(re_date), discharge_time, re_date)) %>%
+  mutate(re_date = openxlsx::convertToDateTime(re_date)) %>%
+  mutate(admission_time = openxlsx::convertToDateTime(admission_time)) %>%
+  mutate(discharge_time = openxlsx::convertToDateTime(discharge_time)) %>%
+  mutate(in_hospital_days = as.numeric(discharge_time - admission_time, units="days")) %>%
+  mutate(gender = recode_factor(gender, `1` = "male", `2` = "female")) %>%
+  mutate(outcome = recode_factor(outcome, `0` = "survived", `1` = "deceased"))
+```
+
+```{r patient-data-summary}
+patient_data <- data %>%
+  select(patient_id, age, gender, outcome, in_hospital_days) %>%
+  distinct(patient_id, .keep_all = TRUE) %>%
+  group_by(patient_id)
+
+general_patient_data <- data.frame(
+  "PatientCount" = nrow(patient_data),
+  "MeanAge" = mean(patient_data$age),
+  "MinAge" = min(patient_data$age),
+  "MaxAge" = max(patient_data$age),
+  "MaleCount" = sum(patient_data$gender == "male"),
+  "FemaleCount" = sum(patient_data$gender == "female"),
+  "MortalityRate" = mean(as.numeric(patient_data$outcome) - 1)
+)
+date_patient_data <- data.frame(
+  "FirstAdmission" = min(data$admission_time),
+  "LastAdmission"= max(data$admission_time),
+  "FirstDischarge" = min(data$discharge_time),
+  "LastDischarge" = max(data$discharge_time),
+  "MinDaysSpent" = ceiling(min(patient_data$in_hospital_days)),
+  "MaxDaysSpent" = ceiling(max(patient_data$in_hospital_days))
+)
+
+knitr::kable(general_patient_data, caption = "Patient data summary")
+knitr::kable(date_patient_data, caption = "Experiment dateframe summary")
+```
+
+### Patient age and mortality
+
+```{r age-distribution}
+ggplot(patient_data, aes(x=age, fill=outcome)) +
+  geom_histogram(binwidth=3) +
+  facet_grid(. ~ gender) + 
+  theme(legend.position="top") +
+  ggtitle("Patient age distribution") + 
+  ylab("number of patients")
+
+```
+
+```{r treatment-days-distribution}
+ggplot(patient_data, aes(x=in_hospital_days, fill=outcome)) +
+  geom_histogram(binwidth=3) +
+  facet_grid(. ~ gender) + 
+  ggtitle("Time spent in hospital") + 
+  ylab("number of patients") + 
+  xlab("treatment days")
+```
+
+```{r mortality-rate-by-age}
+age_survival_data <- data %>%
+  distinct(patient_id, .keep_all = TRUE) %>%
+  group_by(patient_id) %>%
+  mutate(age_bin = cut(age, breaks=c(seq(15,95,5)))) %>%
+  group_by(age_bin, outcome, gender) %>%
+  summarise(mn = n()) %>%
+  spread(outcome, mn, fill=0) %>%
+  mutate(mortality_rate = deceased / (deceased + survived))
+
+ggplot(age_survival_data, aes(x=age_bin, y=mortality_rate)) +
+  geom_point(color="red", fill="white") +
+  facet_grid(gender ~ .) + 
+  ggtitle("Mortality rate by age") + 
+  ylab("mortality rate") + 
+  xlab("age range")
+```
+
+```{r mortality-rate-by-time-in-hospital}
+hos_survival_data <- data %>%
+  distinct(patient_id, .keep_all = TRUE) %>%
+  group_by(patient_id) %>%
+  mutate(in_hospital_days_bin = cut(in_hospital_days, breaks=c(0,3,7,11,15,19,23,27,31,35,39,43,47))) %>%
+  group_by(in_hospital_days_bin, outcome, gender) %>%
+  summarise(mn = n()) %>%
+  spread(outcome, mn, fill=0) %>%
+  mutate(mortality_rate = deceased / (deceased + survived))
+
+ggplot(hos_survival_data, aes(x=in_hospital_days_bin, y=mortality_rate)) +
+  geom_point(color="red", fill="white") +
+  facet_grid(gender ~ .) + 
+  ggtitle("Mortality rate by days spent in hospital") + 
+  ylab("mortality rate") + 
+  xlab("days spent")
+
+```
+&nbsp;
+
+### COVID-19 cases over time
+
+COVID-19 admissions at Wuhan Tongji Hospital increased sharply between 26 January 2020 and 13 February 2020. New admissions culminated on 1 February 2020 and 10 February 2020 with 41 and 49 new cases accordingly. However, the number of deceased rose steadily during first two weeks of February to reach its peak at 13 deceased per day on 18 February 2020. The time window between the first admission peak and daily deceased extreme was 18 days wide.  
+&nbsp;
+
+```{r cases-over-time}
+
+daily_deaths <- data %>%
+  distinct(patient_id, .keep_all = TRUE) %>%
+  select(patient_id, outcome, discharge_time, age, gender) %>%
+  group_by(patient_id) %>%
+  filter(outcome == "deceased") %>%
+  mutate(day = as.POSIXlt(cut(discharge_time, breaks="day")), format="%Y-%m-%d") %>%
+  group_by(day) %>%
+  summarise(deceased = n()) %>%
+  arrange(day)
+
+daily_admissions <- data %>%
+  distinct(patient_id, .keep_all = TRUE) %>%
+  select(patient_id, outcome, admission_time, age, gender) %>%
+  group_by(patient_id) %>%
+  mutate(day = as.POSIXlt(cut(admission_time, breaks="day")), format="%Y-%m-%d") %>%
+  group_by(day) %>%
+  summarise(admitted = n()) %>%
+  arrange(day)
+
+days <- data.frame(day=seq(ISOdate(2020,01,10,0,0,0), ISOdate(2020,03,02,0,0,0), "day"))
+daily_stats <- merge(daily_deaths, daily_admissions, by="day", all=TRUE)
+daily_stats <- merge(daily_stats, days, by="day", all=TRUE) %>%
+  gather(action, count, admitted:deceased) %>%
+  replace(is.na(.), 0)
+
+fig <- plot_ly(
+  x = ~daily_stats$day,
+  y = ~daily_stats$count,
+  split = ~daily_stats$action,
+  type = 'scatter',
+  mode = 'lines',
+  line = list(simplyfy = F)
+)
+fig <- fig %>% layout(
+  title = "Daily deaths and admissions",
+  xaxis = list(
+    title = "Date",
+    zeroline = F
+  ),
+  yaxis = list(
+    title = "No. of patients",
+    zeroline = F
+  )
+)
+fig
+```
+
+### Correlation
+
+High levels of LDH and HS-CRP biomarkers are strongly correlated with fatal cases of COVID-19. It is also noticeable that the greater amount of white blood cells and neutrophils in blood, the higher the probability of deadly outcome. On the other hand, high lymphocytes and albumin levels correlate negatively with fatal cases. Patient age is not the strongest determinant on the outcome, with only 0.58 Pearson correlation score. It seems that gender and time spent in hospital are statistically insignificant to determine the success of the treatment.
+
+```{r correlation}
+
+folded_patient_data <- data %>%
+  group_by(patient_id, age, gender, outcome, in_hospital_days) %>%
+  summarise_at(vars(hypersensitive_cardiac_troponin_i:creatinine), median, na.rm = TRUE ) %>%
+  mutate(gender = as.numeric(gender)) %>%
+  mutate(outcome = as.numeric(outcome) - 1)
+
+cor_data <- as_tibble(round(cor(folded_patient_data, use = "complete.obs"), 2))
+positive_outcome_cor_data <- cor_data[4,] %>%
+  gather("metric", "correlation") %>%
+  filter(correlation > 0.7) %>%
+  filter(metric != "outcome") %>%
+  filter(metric != "patient_id") %>%
+  arrange(desc(correlation))
+
+negative_outcome_cor_data <- cor_data[4,] %>%
+  gather("metric", "correlation") %>%
+  filter(correlation < -0.7) %>%
+  filter(metric != "outcome") %>%
+  filter(metric != "patient_id") %>%
+  arrange(correlation)
+
+suplementary_outcome_cor_data <- cor_data[4,] %>%
+  gather("metric", "correlation")
+
+
+ggplot(positive_outcome_cor_data, aes(x=metric, y=correlation)) +
+  geom_bar(stat="identity") +
+  ggtitle("Highest correlation with outcome = `deceased`") + coord_flip()
+
+ggplot(negative_outcome_cor_data, aes(x=metric, y=correlation)) +
+  geom_bar(stat="identity") +
+  ggtitle("Lowest correlation with outcome = `deceased`") + coord_flip()
+
+knitr::kable(suplementary_outcome_cor_data[c(2,3,5),], caption = "Suplementary correlation with outcome = `deceased`")
+```
+### Classification
+
+Minimizing the number of _false positives_ is critical to evaluate classifier robustness, as COVID-19 proved highly contagious in all age groups. This article focuses on _recall_ measure to verify performance of 3 classifiers:
+
+*   Random Forest
+*   Logistic Regression
+*   K Nearest Neighbours
+
+The original data was split 75:25 to `training_set` and `test_set`. Each model performance was estimated via 10-fold repeated cross validation. Random Forest number of trees was set to 20. k = 17 was selected as optimal for K Nearest Neighbours model.
+
+HS-CRP & LDH levels and lymphocytes percentage were the most discriminative factors for Random Forest (RF) classifier. Feature importance results for Logistic Regression yielded high values for platelet distribution width and overall number of monocytes, neutrophils and lymphocytes in a blood sample.
+
+```{r prepare-set}
+set.seed(66)
+c_data <- data %>%
+  group_by(patient_id, age, gender, outcome, in_hospital_days) %>%
+  summarise_at(vars(hypersensitive_cardiac_troponin_i:creatinine), median, na.rm = TRUE ) %>%
+  ungroup() %>%
+  select(-patient_id)
+c_data <- na_mean(c_data)
+train_ids <-
+  createDataPartition(
+    y=c_data$outcome,
+    p=.75,
+    list=FALSE
+  )
+train_data <- c_data[train_ids, , drop = FALSE]
+test_data <- c_data[-train_ids, , drop = FALSE]
+
+ctrl <- trainControl(
+  method = "repeatedcv",
+  number = 10,
+  repeats = 3,
+  classProbs = TRUE,
+  summaryFunction = multiClassSummary
+)
+metric <- "Recall"
+```
+
+```{r rf-classification}
+set.seed(66)
+rf_fit <- train(
+  outcome ~ ., 
+  data=train_data, 
+  method="rf", 
+  trControl=ctrl,
+  preProcess = c("center", "scale"),
+  metric=metric,
+  ntree=20
+)
+rf_classes <- predict(rf_fit, test_data)
+cm <- confusionMatrix(data = rf_classes, test_data$outcome)
+cm_rf <- as.data.frame(cm$table)
+cm_st <-data.frame(cm$overall)
+cm_st$cm.overall <- round(cm_st$cm.overall,2)
+cm_p <- as.data.frame(prop.table(cm$table))
+cm_rf$Perc <- round(cm_p$Freq*100,2)
+cm_rf$Model <- "RF"
+
+```
+
+```{r glm-classification}
+set.seed(66)
+glm_fit <- train(
+  outcome ~ ., 
+  data=train_data, 
+  method="glm",
+  family=binomial(),
+  preProcess = c("center", "scale"),
+  metric=metric,
+  trControl=ctrl
+)
+glm_classes <- predict(glm_fit, test_data)
+cm <- confusionMatrix(data = glm_classes, test_data$outcome)
+cm_glm <- as.data.frame(cm$table)
+cm_st <-data.frame(cm$overall)
+cm_st$cm.overall <- round(cm_st$cm.overall,2)
+cm_p <- as.data.frame(prop.table(cm$table))
+cm_glm$Perc <- round(cm_p$Freq*100,2)
+cm_glm$Model <- "GLM"
+```
+
+```{r knn-classification}
+set.seed(66)
+knn_fit <- train(
+  outcome ~ ., 
+  data=train_data, 
+  method="knn",
+  preProcess = c("center", "scale"),
+  metric=metric,
+  trControl=ctrl,
+  tuneLength = 10
+)
+knn_classes <- predict(knn_fit, test_data)
+cm <- confusionMatrix(data = knn_classes, test_data$outcome)
+cm_knn <- as.data.frame(cm$table)
+cm_st <-data.frame(cm$overall)
+cm_st$cm.overall <- round(cm_st$cm.overall,2)
+cm_p <- as.data.frame(prop.table(cm$table))
+cm_knn$Perc <- round(cm_p$Freq*100,2)
+cm_knn$Model <- "K-Nearest"
+```
+
+Confusion matrices for all 3 classifiers are displayed below.
+
+```{r confusion-matrix}
+total_cm <- rbind(cm_rf,cm_glm,cm_knn)
+colnames(total_cm)[3] <- "Frequency"
+ggplot(data = total_cm, aes(x=Prediction , y=Reference, fill=Frequency)) +
+  geom_tile() +
+  geom_text(aes(label = paste("",Frequency,",",Perc,"%")), color = 'white', size = 4) +
+  facet_grid(Model ~ .) +
+  theme(legend.position = "right") +
+  ggtitle("Confusion matrix")
+```
+
+### Summary
+
+Logistic Regression classifier is the weakest according to metrics displayed below. KNN model is highly precise but its kappa range is comparable to GLM's. Random Forest classifier yields highest recall, kappa and accuracy values. It could be safely used to classify the possible outcome of COVID-19 based on blood sample results.
+
+```{r compare-models}
+resample_results <- resamples(list(rf=rf_fit, glm=glm_fit, knn=knn_fit))
+densityplot(resample_results , metric = "Precision" ,auto.key = list(columns = 3), main="Precision density")
+densityplot(resample_results , metric = "Kappa" ,auto.key = list(columns = 3), main="Kappa density")
+densityplot(resample_results , metric = "Recall" ,auto.key = list(columns = 3), main="Recall density")
+densityplot(resample_results , metric = "Accuracy" ,auto.key = list(columns = 3),  main="Accuracy density")
+bwplot(resample_results, metric = c("Kappa","Accuracy", "Recall"), main="Classification quality")
+```
+
+## Used packages
+
+```{r show-libs}
+(.packages())
+```
